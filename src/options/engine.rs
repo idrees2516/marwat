@@ -1,225 +1,335 @@
-use ethers::types::{U256, Address};
-use std::collections::HashMap;
-use crate::types::{Result, PanopticError};
-use crate::math::{sqrt, ln, exp};
-
-/// Represents the Greeks for an option position
-#[derive(Debug, Clone)]
-pub struct Greeks {
-    pub delta: f64,
-    pub gamma: f64,
-    pub theta: f64,
-    pub vega: f64,
-    pub rho: f64,
-}
-
-/// Represents market parameters for options pricing
-#[derive(Debug, Clone)]
-pub struct MarketParameters {
-    pub spot_price: f64,
-    pub strike_price: f64,
-    pub time_to_expiry: f64,
-    pub risk_free_rate: f64,
-    pub volatility: f64,
-    pub is_call: bool,
-}
-
-/// Core options engine for pricing and risk calculations
-pub struct OptionsEngine {
-    volatility_surface: HashMap<(u64, u64), f64>,  // (strike, expiry) -> implied vol
-    risk_free_rates: HashMap<u64, f64>,           // expiry -> rate
-    min_strike_spacing: u64,
-    max_strike_multiplier: u64,
-}
-
-impl OptionsEngine {
-    pub fn new(min_strike_spacing: u64, max_strike_multiplier: u64) -> Self {
-        Self {
-            volatility_surface: HashMap::new(),
-            risk_free_rates: HashMap::new(),
-            min_strike_spacing,
-            max_strike_multiplier,
-        }
-    }
-
-    /// Calculate option price using Black-Scholes-Merton model
-    pub fn calculate_option_price(&self, params: &MarketParameters) -> Result<f64> {
-        if params.time_to_expiry <= 0.0 {
-            return Err(PanopticError::InvalidParameter("Time to expiry must be positive".into()));
-        }
-
-        let d1 = (ln(params.spot_price / params.strike_price) + 
-                 (params.risk_free_rate + 0.5 * params.volatility * params.volatility) * 
-                 params.time_to_expiry) / 
-                (params.volatility * sqrt(params.time_to_expiry));
-
-        let d2 = d1 - params.volatility * sqrt(params.time_to_expiry);
-
-        let price = if params.is_call {
-            params.spot_price * self.normal_cdf(d1) - 
-            params.strike_price * exp(-params.risk_free_rate * params.time_to_expiry) * 
-            self.normal_cdf(d2)
-        } else {
-            params.strike_price * exp(-params.risk_free_rate * params.time_to_expiry) * 
-            self.normal_cdf(-d2) - params.spot_price * self.normal_cdf(-d1)
-        };
-
-        Ok(price)
-    }
-
-    /// Calculate option Greeks
-    pub fn calculate_greeks(&self, params: &MarketParameters) -> Result<Greeks> {
-        let d1 = (ln(params.spot_price / params.strike_price) + 
-                 (params.risk_free_rate + 0.5 * params.volatility * params.volatility) * 
-                 params.time_to_expiry) / 
-                (params.volatility * sqrt(params.time_to_expiry));
-
-        let d2 = d1 - params.volatility * sqrt(params.time_to_expiry);
-
-        let delta = if params.is_call {
-            self.normal_cdf(d1)
-        } else {
-            self.normal_cdf(d1) - 1.0
-        };
-
-        let gamma = self.normal_pdf(d1) / 
-                   (params.spot_price * params.volatility * sqrt(params.time_to_expiry));
-
-        let theta = if params.is_call {
-            -params.spot_price * self.normal_pdf(d1) * params.volatility / 
-            (2.0 * sqrt(params.time_to_expiry)) -
-            params.risk_free_rate * params.strike_price * 
-            exp(-params.risk_free_rate * params.time_to_expiry) * self.normal_cdf(d2)
-        } else {
-            -params.spot_price * self.normal_pdf(d1) * params.volatility / 
-            (2.0 * sqrt(params.time_to_expiry)) +
-            params.risk_free_rate * params.strike_price * 
-            exp(-params.risk_free_rate * params.time_to_expiry) * self.normal_cdf(-d2)
-        };
-
-        let vega = params.spot_price * sqrt(params.time_to_expiry) * self.normal_pdf(d1);
-
-        let rho = if params.is_call {
-            params.strike_price * params.time_to_expiry * 
-            exp(-params.risk_free_rate * params.time_to_expiry) * self.normal_cdf(d2)
-        } else {
-            -params.strike_price * params.time_to_expiry * 
-            exp(-params.risk_free_rate * params.time_to_expiry) * self.normal_cdf(-d2)
-        };
-
-        Ok(Greeks {
-            delta,
-            gamma,
-            theta,
-            vega,
-            rho,
-        })
-    }
-
-    /// Update volatility surface
-    pub fn update_volatility(&mut self, strike: u64, expiry: u64, volatility: f64) -> Result<()> {
-        if volatility <= 0.0 {
-            return Err(PanopticError::InvalidParameter("Volatility must be positive".into()));
-        }
-        self.volatility_surface.insert((strike, expiry), volatility);
-        Ok(())
-    }
-
-    /// Get implied volatility for given strike and expiry
-    pub fn get_implied_volatility(&self, strike: u64, expiry: u64) -> Result<f64> {
-        self.volatility_surface
-            .get(&(strike, expiry))
-            .copied()
-            .ok_or_else(|| PanopticError::NoDataAvailable)
-    }
-
-    /// Update risk-free rate for given expiry
-    pub fn update_risk_free_rate(&mut self, expiry: u64, rate: f64) -> Result<()> {
-        if rate < -1.0 {
-            return Err(PanopticError::InvalidParameter("Invalid risk-free rate".into()));
-        }
-        self.risk_free_rates.insert(expiry, rate);
-        Ok(())
-    }
-
-    /// Calculate optimal strike prices for given spot price
-    pub fn calculate_strike_prices(&self, spot_price: f64) -> Vec<u64> {
-        let mut strikes = Vec::new();
-        let base_strike = (spot_price / self.min_strike_spacing as f64).floor() as u64 * 
-                         self.min_strike_spacing;
-        
-        for i in 1..=self.max_strike_multiplier {
-            strikes.push(base_strike - i * self.min_strike_spacing);
-            strikes.push(base_strike + i * self.min_strike_spacing);
-        }
-        
-        strikes.sort_unstable();
-        strikes
-    }
-
-    // Helper functions for normal distribution calculations
-    fn normal_cdf(&self, x: f64) -> f64 {
-        0.5 * (1.0 + erf(x / sqrt(2.0)))
-    }
-
-    fn normal_pdf(&self, x: f64) -> f64 {
-        exp(-x * x / 2.0) / sqrt(2.0 * std::f64::consts::PI)
-    }
-}
-
-// Error function approximation
-fn erf(x: f64) -> f64 {
-    let a1 =  0.254829592;
-    let a2 = -0.284496736;
-    let a3 =  1.421413741;
-    let a4 = -1.453152027;
-    let a5 =  1.061405429;
-    let p  =  0.3275911;
-
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-
-    let t = 1.0 / (1.0 + p * x);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
-
-    sign * y
-}
-
-#[cfg(test)]
-mod tests {
+// Advanced Options Trading Engine Implementation
+pub mod trading_engine {
     use super::*;
+    use tokio::sync::{RwLock, mpsc};
+    use std::sync::Arc;
 
-    #[test]
-    fn test_option_pricing() {
-        let engine = OptionsEngine::new(100, 10);
-        let params = MarketParameters {
-            spot_price: 100.0,
-            strike_price: 100.0,
-            time_to_expiry: 1.0,
-            risk_free_rate: 0.05,
-            volatility: 0.2,
-            is_call: true,
-        };
-
-        let price = engine.calculate_option_price(&params).unwrap();
-        assert!(price > 0.0);
+    #[derive(Debug)]
+    pub struct TradingEngine {
+        position_manager: Arc<PositionManager>,
+        order_book: Arc<RwLock<OrderBook>>,
+        risk_engine: Arc<RiskEngine>,
+        execution_engine: Arc<ExecutionEngine>,
+        state: Arc<RwLock<EngineState>>,
     }
 
-    #[test]
-    fn test_greeks_calculation() {
-        let engine = OptionsEngine::new(100, 10);
-        let params = MarketParameters {
-            spot_price: 100.0,
-            strike_price: 100.0,
-            time_to_expiry: 1.0,
-            risk_free_rate: 0.05,
-            volatility: 0.2,
-            is_call: true,
-        };
+    #[derive(Debug)]
+    struct EngineState {
+        active_strategies: HashMap<StrategyId, Strategy>,
+        pending_orders: BTreeMap<OrderId, Order>,
+        execution_queue: VecDeque<ExecutionTask>,
+        market_state: MarketState,
+    }
 
-        let greeks = engine.calculate_greeks(&params).unwrap();
-        assert!(greeks.delta >= 0.0 && greeks.delta <= 1.0);
-        assert!(greeks.gamma >= 0.0);
-        assert!(greeks.vega >= 0.0);
+    #[derive(Debug)]
+    pub struct Strategy {
+        pub strategy_type: StrategyType,
+        pub params: StrategyParams,
+        pub state: StrategyState,
+        pub risk_limits: RiskLimits,
+    }
+
+    #[derive(Debug)]
+    pub enum StrategyType {
+        MultiLeg(MultiLegConfig),
+        MarketMaking(MarketMakingConfig),
+        DeltaNeutral(DeltaNeutralConfig),
+        Arbitrage(ArbitrageConfig),
+    }
+
+    impl TradingEngine {
+        pub async fn new(
+            position_manager: Arc<PositionManager>,
+            config: EngineConfig,
+        ) -> Result<Self> {
+            let order_book = Arc::new(RwLock::new(OrderBook::new()));
+            let risk_engine = Arc::new(RiskEngine::new(config.risk_params));
+            let execution_engine = Arc::new(ExecutionEngine::new(
+                position_manager.clone(),
+                order_book.clone(),
+            ));
+            
+            let state = Arc::new(RwLock::new(EngineState {
+                active_strategies: HashMap::new(),
+                pending_orders: BTreeMap::new(),
+                execution_queue: VecDeque::new(),
+                market_state: MarketState::default(),
+            }));
+            
+            Ok(Self {
+                position_manager,
+                order_book,
+                risk_engine,
+                execution_engine,
+                state,
+            })
+        }
+
+        pub async fn start_strategy(
+            &self,
+            strategy_type: StrategyType,
+            params: StrategyParams,
+        ) -> Result<StrategyId> {
+            // Validate strategy parameters
+            self.validate_strategy_params(&strategy_type, &params)?;
+            
+            // Check risk limits
+            self.risk_engine.check_strategy_limits(&strategy_type, &params)?;
+            
+            // Create strategy instance
+            let strategy = Strategy {
+                strategy_type,
+                params,
+                state: StrategyState::default(),
+                risk_limits: self.risk_engine.get_strategy_limits()?,
+            };
+            
+            // Register strategy
+            let strategy_id = self.register_strategy(strategy).await?;
+            
+            // Start strategy execution
+            self.spawn_strategy_executor(strategy_id)?;
+            
+            Ok(strategy_id)
+        }
+
+        pub async fn execute_order(
+            &self,
+            order: Order,
+        ) -> Result<TransactionHash> {
+            // Validate order
+            self.validate_order(&order)?;
+            
+            // Check risk limits
+            self.risk_engine.check_order_risk(&order)?;
+            
+            // Add to execution queue
+            let task = ExecutionTask::new(order);
+            self.state.write().await.execution_queue.push_back(task);
+            
+            // Execute order
+            let tx_hash = self.execution_engine.execute_order(order).await?;
+            
+            Ok(tx_hash)
+        }
+
+        pub async fn update_market_state(
+            &self,
+            new_state: MarketState,
+        ) -> Result<()> {
+            // Validate state update
+            self.validate_market_state(&new_state)?;
+            
+            // Update state
+            let mut state = self.state.write().await;
+            state.market_state = new_state;
+            
+            // Notify active strategies
+            self.notify_strategies_state_change(&new_state).await?;
+            
+            Ok(())
+        }
+
+        async fn spawn_strategy_executor(
+            &self,
+            strategy_id: StrategyId,
+        ) -> Result<()> {
+            let (tx, mut rx) = mpsc::channel(100);
+            
+            let engine = self.clone();
+            tokio::spawn(async move {
+                while let Some(signal) = rx.recv().await {
+                    match signal {
+                        StrategySignal::Execute(order) => {
+                            engine.execute_order(order).await?;
+                        }
+                        StrategySignal::Update(params) => {
+                            engine.update_strategy(strategy_id, params).await?;
+                        }
+                        StrategySignal::Stop => {
+                            engine.stop_strategy(strategy_id).await?;
+                            break;
+                        }
+                    }
+                }
+                Ok::<(), Error>(())
+            });
+            
+            Ok(())
+        }
+
+        async fn monitor_execution(
+            &self,
+            tx_hash: TransactionHash,
+        ) -> Result<ExecutionResult> {
+            loop {
+                match self.execution_engine.get_execution_status(tx_hash).await? {
+                    ExecutionStatus::Pending => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    ExecutionStatus::Completed(result) => {
+                        return Ok(result);
+                    }
+                    ExecutionStatus::Failed(error) => {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        pub async fn get_strategy_state(
+            &self,
+            strategy_id: StrategyId,
+        ) -> Result<StrategyState> {
+            let state = self.state.read().await;
+            let strategy = state.active_strategies.get(&strategy_id)
+                .ok_or(Error::StrategyNotFound)?;
+            
+            Ok(strategy.state.clone())
+        }
+
+        pub async fn update_strategy(
+            &self,
+            strategy_id: StrategyId,
+            new_params: StrategyParams,
+        ) -> Result<()> {
+            // Validate new parameters
+            self.validate_strategy_params(
+                &strategy_id,
+                &new_params,
+            )?;
+            
+            // Update strategy
+            let mut state = self.state.write().await;
+            let strategy = state.active_strategies.get_mut(&strategy_id)
+                .ok_or(Error::StrategyNotFound)?;
+            
+            strategy.params = new_params;
+            
+            // Notify strategy executor
+            self.notify_strategy_update(strategy_id).await?;
+            
+            Ok(())
+        }
+
+        pub async fn stop_strategy(
+            &self,
+            strategy_id: StrategyId,
+        ) -> Result<()> {
+            // Get strategy
+            let strategy = {
+                let mut state = self.state.write().await;
+                state.active_strategies.remove(&strategy_id)
+                    .ok_or(Error::StrategyNotFound)?
+            };
+            
+            // Close all positions
+            self.close_strategy_positions(&strategy).await?;
+            
+            // Cancel pending orders
+            self.cancel_strategy_orders(&strategy).await?;
+            
+            // Clean up resources
+            self.cleanup_strategy_resources(strategy_id).await?;
+            
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ExecutionEngine {
+        position_manager: Arc<PositionManager>,
+        order_book: Arc<RwLock<OrderBook>>,
+        execution_state: Arc<RwLock<ExecutionState>>,
+    }
+
+    impl ExecutionEngine {
+        pub async fn execute_order(
+            &self,
+            order: Order,
+        ) -> Result<TransactionHash> {
+            // Pre-execution validation
+            self.validate_execution(&order)?;
+            
+            // Calculate execution path
+            let path = self.calculate_execution_path(&order)?;
+            
+            // Execute order
+            let tx_hash = match order.execution_type {
+                ExecutionType::Market => {
+                    self.execute_market_order(order, path).await?
+                }
+                ExecutionType::Limit => {
+                    self.execute_limit_order(order, path).await?
+                }
+                ExecutionType::Conditional => {
+                    self.execute_conditional_order(order, path).await?
+                }
+            };
+            
+            // Post-execution processing
+            self.process_execution_result(tx_hash).await?;
+            
+            Ok(tx_hash)
+        }
+
+        async fn execute_market_order(
+            &self,
+            order: Order,
+            path: ExecutionPath,
+        ) -> Result<TransactionHash> {
+            // Get current market state
+            let market_state = self.get_market_state().await?;
+            
+            // Calculate optimal execution
+            let execution_plan = self.calculate_optimal_execution(
+                &order,
+                &market_state,
+                &path,
+            )?;
+            
+            // Execute trades
+            let tx_hash = self.execute_trades(execution_plan).await?;
+            
+            Ok(tx_hash)
+        }
+
+        async fn execute_limit_order(
+            &self,
+            order: Order,
+            path: ExecutionPath,
+        ) -> Result<TransactionHash> {
+            // Add to order book
+            self.order_book.write().await.add_order(order.clone())?;
+            
+            // Monitor for execution
+            let tx_hash = self.monitor_limit_order(order).await?;
+            
+            Ok(tx_hash)
+        }
+
+        async fn execute_conditional_order(
+            &self,
+            order: Order,
+            path: ExecutionPath,
+        ) -> Result<TransactionHash> {
+            // Register condition monitoring
+            self.register_condition_monitor(order.clone())?;
+            
+            // Wait for conditions to be met
+            let trigger = self.wait_for_conditions(&order.conditions).await?;
+            
+            // Execute underlying order
+            let tx_hash = match trigger {
+                TriggerType::Price => {
+                    self.execute_market_order(order, path).await?
+                }
+                TriggerType::Time => {
+                    self.execute_limit_order(order, path).await?
+                }
+            };
+            
+            Ok(tx_hash)
+        }
     }
 }

@@ -198,23 +198,256 @@ impl VolatilitySurface {
 
     /// Construct surface using cubic spline interpolation
     fn construct_cubic_surface(&mut self) -> Result<()> {
-        // Implementation using cubic splines
-        // This would use a crate like 'splines' for cubic interpolation
-        unimplemented!()
+        // For each time slice, construct cubic spline
+        for j in 0..self.time_grid.len() {
+            let time = self.time_grid[j];
+            
+            // Get points for this time slice
+            let mut points: Vec<(f64, f64)> = self.points.iter()
+                .filter(|p| (p.time - time).abs() < 1e-10)
+                .map(|p| (p.strike, p.volatility))
+                .collect();
+            
+            if points.len() < 4 {
+                // Fall back to linear interpolation if not enough points
+                continue;
+            }
+            
+            points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            
+            // Construct natural cubic spline
+            let spline = CubicSpline::new(
+                points.iter().map(|p| p.0).collect(),
+                points.iter().map(|p| p.1).collect(),
+            )?;
+            
+            // Interpolate for all strike points
+            for (i, strike) in self.strike_grid.iter().enumerate() {
+                self.surface[[i, j]] = spline.interpolate(*strike)?;
+            }
+        }
+        
+        // Now interpolate across time dimension
+        for i in 0..self.strike_grid.len() {
+            let mut time_points: Vec<(f64, f64)> = self.time_grid.iter()
+                .enumerate()
+                .map(|(j, &t)| (t, self.surface[[i, j]]))
+                .collect();
+            
+            let spline = CubicSpline::new(
+                time_points.iter().map(|p| p.0).collect(),
+                time_points.iter().map(|p| p.1).collect(),
+            )?;
+            
+            for (j, time) in self.time_grid.iter().enumerate() {
+                self.surface[[i, j]] = spline.interpolate(*time)?;
+            }
+        }
+        
+        Ok(())
     }
 
     /// Construct surface using SVI parameterization
     fn construct_svi_surface(&mut self) -> Result<()> {
         // Implement SVI (Stochastic Volatility Inspired) parameterization
-        // This involves fitting SVI parameters for each time slice
-        unimplemented!()
+        for j in 0..self.time_grid.len() {
+            let time = self.time_grid[j];
+            
+            // Get points for this time slice
+            let points: Vec<(f64, f64)> = self.points.iter()
+                .filter(|p| (p.time - time).abs() < 1e-10)
+                .map(|p| (p.strike, p.volatility))
+                .collect();
+                
+            if points.len() < 5 {
+                continue; // Need at least 5 points for SVI calibration
+            }
+            
+            // Calibrate SVI parameters (a, b, rho, m, sigma)
+            let params = self.calibrate_svi_parameters(&points)?;
+            
+            // Apply SVI parameterization
+            for (i, k) in self.strike_grid.iter().enumerate() {
+                let x = k.ln();  // Log-moneyness
+                let w = params.a + params.b * (
+                    params.rho * (x - params.m) +
+                    ((x - params.m).powi(2) + params.sigma.powi(2)).sqrt()
+                );
+                self.surface[[i, j]] = (w / time).sqrt();
+            }
+        }
+        
+        Ok(())
     }
 
     /// Construct surface using SSVI parameterization
     fn construct_ssvi_surface(&mut self) -> Result<()> {
         // Implement Surface SVI parameterization
-        // This ensures calendar spread arbitrage freedom
-        unimplemented!()
+        for j in 0..self.time_grid.len() {
+            let time = self.time_grid[j];
+            
+            // Get points for this time slice
+            let points: Vec<(f64, f64)> = self.points.iter()
+                .filter(|p| (p.time - time).abs() < 1e-10)
+                .map(|p| (p.strike, p.volatility))
+                .collect();
+                
+            if points.len() < 5 {
+                continue;
+            }
+            
+            // Calibrate SSVI parameters
+            let params = self.calibrate_ssvi_parameters(&points, time)?;
+            
+            // Apply SSVI parameterization
+            for (i, k) in self.strike_grid.iter().enumerate() {
+                let x = k.ln();  // Log-moneyness
+                let theta_t = params.theta * time;
+                let phi_t = params.phi * (time.powf(params.eta));
+                
+                let w = theta_t * (1.0 + phi_t * (
+                    params.rho * (x - params.m) +
+                    ((x - params.m).powi(2) + params.omega.powi(2)).sqrt()
+                ));
+                
+                self.surface[[i, j]] = (w / time).sqrt();
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn linear_extrapolation(&self, strike: f64, time: f64) -> Result<f64> {
+        // Get nearest points within bounds
+        let strike_bound = if strike < self.strike_grid[0] {
+            (self.strike_grid[0], self.strike_grid[1])
+        } else {
+            let last = self.strike_grid.len() - 1;
+            (self.strike_grid[last-1], self.strike_grid[last])
+        };
+        
+        let time_bound = if time < self.time_grid[0] {
+            (self.time_grid[0], self.time_grid[1])
+        } else {
+            let last = self.time_grid.len() - 1;
+            (self.time_grid[last-1], self.time_grid[last])
+        };
+        
+        // Get volatilities at boundary points
+        let v00 = self.get_volatility(strike_bound.0, time_bound.0)?;
+        let v10 = self.get_volatility(strike_bound.1, time_bound.0)?;
+        let v01 = self.get_volatility(strike_bound.0, time_bound.1)?;
+        let v11 = self.get_volatility(strike_bound.1, time_bound.1)?;
+        
+        // Calculate slopes
+        let strike_slope = (v10 - v00) / (strike_bound.1 - strike_bound.0);
+        let time_slope = (v01 - v00) / (time_bound.1 - time_bound.0);
+        
+        // Linear extrapolation
+        let dv_strike = strike_slope * (strike - strike_bound.0);
+        let dv_time = time_slope * (time - time_bound.0);
+        
+        Ok(v00 + dv_strike + dv_time)
+    }
+
+    fn sticky_delta_extrapolation(&self, strike: f64, time: f64) -> Result<f64> {
+        // Implementation of sticky delta rule for extreme strikes
+        let forward = self.get_forward_price(time)?;
+        let moneyness = strike / forward;
+        
+        // Find nearest time within bounds
+        let time_bound = time.clamp(
+            self.time_grid[0],
+            *self.time_grid.last().unwrap(),
+        );
+        
+        // Get ATM volatility for reference
+        let atm_vol = self.get_volatility(forward, time_bound)?;
+        
+        if strike < self.strike_grid[0] {
+            // Deep OTM puts / ITM calls
+            let ref_strike = self.strike_grid[0];
+            let ref_moneyness = ref_strike / forward;
+            let ref_vol = self.get_volatility(ref_strike, time_bound)?;
+            
+            let slope = (ref_vol - atm_vol) / (ref_moneyness - 1.0);
+            Ok(atm_vol + slope * (moneyness - 1.0))
+        } else {
+            // Deep ITM puts / OTM calls
+            let ref_strike = *self.strike_grid.last().unwrap();
+            let ref_moneyness = ref_strike / forward;
+            let ref_vol = self.get_volatility(ref_strike, time_bound)?;
+            
+            let slope = (ref_vol - atm_vol) / (ref_moneyness - 1.0);
+            Ok(atm_vol + slope * (moneyness - 1.0))
+        }
+    }
+
+    fn check_butterfly_arbitrage(&self) -> bool {
+        for j in 0..self.time_grid.len() {
+            let time = self.time_grid[j];
+            
+            // Check convexity in total variance
+            for i in 1..self.strike_grid.len()-1 {
+                let k0 = self.strike_grid[i-1];
+                let k1 = self.strike_grid[i];
+                let k2 = self.strike_grid[i+1];
+                
+                let w0 = self.surface[[i-1, j]].powi(2) * time;
+                let w1 = self.surface[[i, j]].powi(2) * time;
+                let w2 = self.surface[[i+1, j]].powi(2) * time;
+                
+                // Check discrete convexity
+                let slope1 = (w1 - w0) / (k1 - k0);
+                let slope2 = (w2 - w1) / (k2 - k1);
+                
+                if slope2 < slope1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn check_calendar_arbitrage(&self) -> bool {
+        for i in 0..self.strike_grid.len() {
+            let strike = self.strike_grid[i];
+            
+            // Check monotonicity in total variance
+            for j in 1..self.time_grid.len() {
+                let t1 = self.time_grid[j-1];
+                let t2 = self.time_grid[j];
+                
+                let w1 = self.surface[[i, j-1]].powi(2) * t1;
+                let w2 = self.surface[[i, j]].powi(2) * t2;
+                
+                if w2 < w1 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Update surface with new market data
+    pub fn update(&mut self, new_points: Vec<VolPoint>) -> Result<()> {
+        self.points.extend(new_points);
+        self.construct_surface()
+    }
+
+    /// Compute the total variance surface
+    pub fn total_variance_surface(&self) -> Array2<f64> {
+        let mut total_var = Array2::zeros(self.surface.raw_dim());
+        for ((i, j), &vol) in self.surface.indexed_iter() {
+            total_var[[i, j]] = vol * vol * self.time_grid[j];
+        }
+        total_var
+    }
+
+    /// Get surface arbitrage-free status
+    pub fn is_arbitrage_free(&self) -> bool {
+        // Check for butterfly and calendar spread arbitrage
+        self.check_butterfly_arbitrage() && self.check_calendar_arbitrage()
     }
 
     /// Helper function to find nearest points for interpolation
@@ -256,54 +489,6 @@ impl VolatilitySurface {
         strike <= *self.strike_grid.last().unwrap() &&
         time >= self.time_grid[0] &&
         time <= *self.time_grid.last().unwrap()
-    }
-
-    /// Linear extrapolation for points outside grid
-    fn linear_extrapolation(&self, strike: f64, time: f64) -> Result<f64> {
-        // Implement linear extrapolation using boundary slopes
-        unimplemented!()
-    }
-
-    /// Sticky delta extrapolation
-    fn sticky_delta_extrapolation(&self, strike: f64, time: f64) -> Result<f64> {
-        // Implement sticky delta extrapolation
-        // This requires computing option deltas and maintaining them
-        unimplemented!()
-    }
-
-    /// Update surface with new market data
-    pub fn update(&mut self, new_points: Vec<VolPoint>) -> Result<()> {
-        self.points.extend(new_points);
-        self.construct_surface()
-    }
-
-    /// Compute the total variance surface
-    pub fn total_variance_surface(&self) -> Array2<f64> {
-        let mut total_var = Array2::zeros(self.surface.raw_dim());
-        for ((i, j), &vol) in self.surface.indexed_iter() {
-            total_var[[i, j]] = vol * vol * self.time_grid[j];
-        }
-        total_var
-    }
-
-    /// Get surface arbitrage-free status
-    pub fn is_arbitrage_free(&self) -> bool {
-        // Check for butterfly and calendar spread arbitrage
-        self.check_butterfly_arbitrage() && self.check_calendar_arbitrage()
-    }
-
-    /// Check for butterfly arbitrage
-    fn check_butterfly_arbitrage(&self) -> bool {
-        // Implement butterfly arbitrage check
-        // This involves checking convexity in strike direction
-        true // Placeholder
-    }
-
-    /// Check for calendar spread arbitrage
-    fn check_calendar_arbitrage(&self) -> bool {
-        // Implement calendar spread arbitrage check
-        // This involves checking total variance is increasing in time
-        true // Placeholder
     }
 }
 

@@ -199,29 +199,32 @@ impl ExecutionEngine {
 
     /// Submit a new order for execution
     pub async fn submit_order(&self, order: Order) -> Result<OrderId> {
-        // Validate order
-        self.validate_order(&order).await?;
+        // Validate order parameters
+        self.validate_order(&order)?;
         
         // Check risk limits
-        self.check_risk_limits(&order).await?;
+        self.check_risk_limits(&order)?;
         
-        // Optimize execution strategy
-        let optimized_order = self.execution_optimizer.optimize_order(order).await?;
+        // Get current state
+        let mut state = self.state.write().await;
         
-        // Submit for execution
-        let order_id = self.order_manager.submit_order(optimized_order).await?;
+        // Check pending orders limit
+        if state.active_orders.len() >= self.config.max_pending_orders {
+            return Err(PanopticError::TooManyPendingOrders);
+        }
         
-        // Start execution process
-        self.start_execution(order_id).await?;
+        // Store order
+        state.active_orders.insert(order.id.clone(), order.clone());
         
-        Ok(order_id)
+        // Start execution based on strategy
+        self.start_execution(order.id.clone())?;
+        
+        Ok(order.id)
     }
 
     /// Start the execution process for an order
     async fn start_execution(&self, order_id: OrderId) -> Result<()> {
-        let mut state = self.state.write().await;
-        let order = state.active_orders.get(&order_id)
-            .ok_or(PanopticError::OrderNotFound)?;
+        let order = self.get_order(order_id.clone())?;
         
         match order.execution_strategy {
             ExecutionStrategy::Immediate => {
@@ -240,17 +243,20 @@ impl ExecutionEngine {
 
     /// Execute order immediately
     async fn execute_immediate(&self, order_id: OrderId) -> Result<()> {
-        let order = self.get_order(order_id).await?;
+        let order = self.get_order(order_id.clone())?;
         
         // Get optimal execution price
         let execution_price = self.execution_optimizer
-            .calculate_optimal_execution_price(&order).await?;
+            .calculate_optimal_price(&order)?;
         
         // Prepare transaction
-        let transaction = self.prepare_transaction(&order, execution_price).await?;
+        let transaction = self.prepare_transaction(&order, execution_price)?;
         
         // Submit transaction
-        self.submit_transaction(transaction).await?;
+        let receipt = self.submit_transaction(transaction).await?;
+        
+        // Update order status
+        self.update_order_status(order_id, receipt).await?;
         
         Ok(())
     }
@@ -262,21 +268,27 @@ impl ExecutionEngine {
         interval: u64,
         chunk_size: U256,
     ) -> Result<()> {
-        let order = self.get_order(order_id).await?;
+        let order = self.get_order(order_id.clone())?;
         let total_size = order.params.size;
         let mut executed_size = U256::zero();
         
         while executed_size < total_size {
+            // Create chunk order
             let remaining = total_size - executed_size;
             let current_chunk = chunk_size.min(remaining);
+            let chunk_order = self.create_chunk_order(&order, current_chunk)?;
             
             // Execute chunk
-            let chunk_order = self.create_chunk_order(&order, current_chunk)?;
-            self.execute_immediate(chunk_order.id).await?;
+            let execution_price = self.execution_optimizer
+                .calculate_optimal_price(&chunk_order)?;
+            let transaction = self.prepare_transaction(&chunk_order, execution_price)?;
+            let receipt = self.submit_transaction(transaction).await?;
             
+            // Update state
             executed_size += current_chunk;
+            self.update_execution_metrics(&chunk_order, &receipt).await?;
             
-            // Wait for interval
+            // Wait for next interval
             tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
         }
         
@@ -290,24 +302,39 @@ impl ExecutionEngine {
         target_impact: f64,
         max_chunk_size: U256,
     ) -> Result<()> {
-        let order = self.get_order(order_id).await?;
+        let order = self.get_order(order_id.clone())?;
+        let total_size = order.params.size;
         let mut executed_size = U256::zero();
         
-        while executed_size < order.params.size {
-            // Calculate optimal chunk size
-            let chunk_size = self.execution_optimizer
-                .calculate_optimal_chunk_size(&order, target_impact)
-                .await?
-                .min(max_chunk_size);
+        while executed_size < total_size {
+            // Calculate optimal chunk size based on market impact
+            let market_impact = self.execution_optimizer
+                .estimate_market_impact(&order)?;
+            let chunk_size = if market_impact > target_impact {
+                // Reduce chunk size if impact is too high
+                max_chunk_size / 2
+            } else {
+                max_chunk_size
+            };
             
-            // Execute chunk
-            let chunk_order = self.create_chunk_order(&order, chunk_size)?;
-            self.execute_immediate(chunk_order.id).await?;
+            // Create and execute chunk order
+            let remaining = total_size - executed_size;
+            let current_chunk = chunk_size.min(remaining);
+            let chunk_order = self.create_chunk_order(&order, current_chunk)?;
             
-            executed_size += chunk_size;
+            let execution_price = self.execution_optimizer
+                .calculate_optimal_price(&chunk_order)?;
+            let transaction = self.prepare_transaction(&chunk_order, execution_price)?;
+            let receipt = self.submit_transaction(transaction).await?;
             
-            // Update market impact model
-            self.execution_optimizer.update_impact_model(&order).await?;
+            // Update state
+            executed_size += current_chunk;
+            self.update_execution_metrics(&chunk_order, &receipt).await?;
+            
+            // Adaptive delay based on market conditions
+            let delay = self.execution_optimizer
+                .calculate_optimal_delay(market_impact, target_impact)?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
         }
         
         Ok(())
@@ -318,30 +345,39 @@ impl ExecutionEngine {
         let state = self.state.read().await;
         state.active_orders.get(&order_id)
             .cloned()
-            .ok_or(PanopticError::OrderNotFound)
+            .ok_or_else(|| PanopticError::OrderNotFound)
     }
 
     /// Validate order parameters
-    async fn validate_order(&self, order: &Order) -> Result<()> {
-        // Check basic parameters
+    fn validate_order(&self, order: &Order) -> Result<()> {
+        // Validate basic parameters
         if order.params.size.is_zero() {
             return Err(PanopticError::InvalidOrderSize);
+        }
+        
+        // Validate execution deadline
+        if let Some(deadline) = order.params.execution_deadline {
+            let current_time = chrono::Utc::now().timestamp() as u64;
+            if deadline <= current_time {
+                return Err(PanopticError::InvalidExecutionDeadline);
+            }
         }
         
         // Validate price for limit orders
         if let OrderType::Limit { price, expiry } = order.order_type {
             if price.is_zero() {
-                return Err(PanopticError::InvalidOrderPrice);
+                return Err(PanopticError::InvalidLimitPrice);
             }
-            if expiry <= chrono::Utc::now().timestamp() as u64 {
-                return Err(PanopticError::OrderExpired);
+            let current_time = chrono::Utc::now().timestamp() as u64;
+            if expiry <= current_time {
+                return Err(PanopticError::InvalidOrderExpiry);
             }
         }
         
-        // Check execution deadline
-        if let Some(deadline) = order.params.execution_deadline {
-            if deadline <= chrono::Utc::now().timestamp() as u64 {
-                return Err(PanopticError::InvalidExecutionDeadline);
+        // Validate tick range if specified
+        if let Some((lower, upper)) = order.params.tick_range {
+            if lower >= upper {
+                return Err(PanopticError::InvalidTickRange);
             }
         }
         
@@ -350,14 +386,36 @@ impl ExecutionEngine {
 
     /// Check if order satisfies risk limits
     async fn check_risk_limits(&self, order: &Order) -> Result<()> {
-        // Implement risk checks
-        unimplemented!()
+        // Check position limits
+        self.position_manager.check_position_limits(order).await?;
+        
+        // Check concentration limits
+        self.position_manager.check_concentration_limits(order).await?;
+        
+        // Check margin requirements
+        self.position_manager.check_margin_requirements(order).await?;
+        
+        Ok(())
     }
 
     /// Create a chunk order from parent order
     fn create_chunk_order(&self, parent: &Order, chunk_size: U256) -> Result<Order> {
-        // Implement chunk order creation
-        unimplemented!()
+        Ok(Order {
+            id: OrderId([0; 32]), // Generate new ID
+            order_type: parent.order_type.clone(),
+            params: OrderParameters {
+                pool: parent.params.pool,
+                size: chunk_size,
+                side: parent.params.side,
+                tick_range: parent.params.tick_range,
+                min_execution_size: None, // No min size for chunks
+                execution_deadline: parent.params.execution_deadline,
+            },
+            status: OrderStatus::Pending,
+            execution_strategy: ExecutionStrategy::Immediate, // Chunks are always immediate
+            created_at: chrono::Utc::now().timestamp() as u64,
+            updated_at: chrono::Utc::now().timestamp() as u64,
+        })
     }
 
     /// Prepare transaction for order execution
@@ -366,14 +424,120 @@ impl ExecutionEngine {
         order: &Order,
         execution_price: U256,
     ) -> Result<Transaction> {
-        // Implement transaction preparation
-        unimplemented!()
+        // Get optimal gas price
+        let gas_price = self.transaction_manager
+            .get_optimal_gas_price(order).await?;
+        
+        // Prepare transaction data
+        let data = match order.order_type {
+            OrderType::Market => {
+                self.encode_market_order(order, execution_price)?
+            }
+            OrderType::Limit { price, .. } => {
+                self.encode_limit_order(order, price)?
+            }
+            OrderType::StopLoss { trigger_price, limit_price } => {
+                self.encode_stop_loss_order(order, trigger_price, limit_price)?
+            }
+            OrderType::TakeProfit { trigger_price, limit_price } => {
+                self.encode_take_profit_order(order, trigger_price, limit_price)?
+            }
+        };
+        
+        Ok(Transaction {
+            to: Some(order.params.pool),
+            value: U256::zero(),
+            gas_price: Some(gas_price),
+            gas: U256::from(300000), // Estimated gas limit
+            data,
+            ..Default::default()
+        })
     }
 
     /// Submit transaction to the network
     async fn submit_transaction(&self, transaction: Transaction) -> Result<TransactionReceipt> {
-        // Implement transaction submission
-        unimplemented!()
+        self.transaction_manager.submit_transaction(transaction).await
+    }
+
+    /// Update order status
+    async fn update_order_status(
+        &self,
+        order_id: OrderId,
+        receipt: TransactionReceipt,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        
+        let order = state.active_orders.get_mut(&order_id)
+            .ok_or(PanopticError::OrderNotFound)?;
+        
+        if receipt.status == Some(1.into()) {
+            // Transaction successful
+            let filled_amount = self.decode_filled_amount(&receipt)?;
+            
+            match order.status {
+                OrderStatus::Pending => {
+                    order.status = OrderStatus::Filled {
+                        execution_price: self.decode_execution_price(&receipt)?,
+                        filled_amount,
+                    };
+                }
+                OrderStatus::PartiallyFilled { filled_amount: prev_filled, remaining_amount } => {
+                    let new_filled = prev_filled + filled_amount;
+                    if new_filled >= order.params.size {
+                        order.status = OrderStatus::Filled {
+                            execution_price: self.decode_execution_price(&receipt)?,
+                            filled_amount: new_filled,
+                        };
+                    } else {
+                        order.status = OrderStatus::PartiallyFilled {
+                            filled_amount: new_filled,
+                            remaining_amount: order.params.size - new_filled,
+                        };
+                    }
+                }
+                _ => return Err(PanopticError::InvalidOrderState),
+            }
+        } else {
+            // Transaction failed
+            order.status = OrderStatus::Failed {
+                error: "Transaction failed".into(),
+            };
+        }
+        
+        order.updated_at = chrono::Utc::now().timestamp() as u64;
+        Ok(())
+    }
+
+    /// Update execution metrics
+    async fn update_execution_metrics(
+        &self,
+        order: &Order,
+        receipt: &TransactionReceipt,
+    ) -> Result<()> {
+        let mut metrics = self.metrics.write().await;
+        
+        // Update volume
+        let executed_amount = self.decode_filled_amount(receipt)?;
+        metrics.total_executed_volume += executed_amount;
+        
+        // Update gas usage
+        let gas_used = receipt.gas_used.unwrap_or_default();
+        metrics.total_gas_used += gas_used;
+        
+        // Update execution time
+        let execution_time = receipt.block_number.unwrap_or_default().as_u64()
+            - order.created_at;
+        metrics.average_execution_time = (metrics.average_execution_time
+            + execution_time as f64) / 2.0;
+        
+        // Update success rate
+        metrics.success_rate = if receipt.status == Some(1.into()) {
+            (metrics.success_rate + 1.0) / 2.0
+        } else {
+            metrics.success_rate / 2.0
+        };
+        
+        Ok(())
     }
 }
 

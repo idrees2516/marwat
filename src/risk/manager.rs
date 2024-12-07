@@ -345,4 +345,196 @@ impl RiskManager {
             Err(PanopticError::PositionNotFound)
         }
     }
+
+    fn calculate_position_leverage(&self, pool: &Pool, position: &Position) -> Result<f64> {
+        let notional_value = self.calculate_notional_value(pool, position)?;
+        let collateral = position.collateral.as_u128() as f64;
+        
+        if collateral == 0.0 {
+            return Ok(f64::INFINITY);
+        }
+        
+        Ok(notional_value / collateral)
+    }
+
+    fn calculate_concentration(&self, pool: &Pool, position: &Position) -> Result<f64> {
+        let position_notional = self.calculate_notional_value(pool, position)?;
+        let pool_total_notional = pool.total_notional().as_u128() as f64;
+        
+        if pool_total_notional == 0.0 {
+            return Ok(1.0);
+        }
+        
+        Ok(position_notional / pool_total_notional)
+    }
+
+    fn stress_test_position(&self, pool: &Pool, position: &Position) -> Result<Vec<f64>> {
+        let mut results = Vec::new();
+        
+        for scenario in &self.parameters.stress_test_scenarios {
+            // Calculate stressed price
+            let base_price = pool.current_price()?;
+            let stressed_price = base_price.as_u128() as f64 * (1.0 + scenario.price_change);
+            
+            // Calculate stressed volatility
+            let base_vol = self.pricing_engine.get_implied_volatility(pool)?;
+            let stressed_vol = base_vol * (1.0 + scenario.volatility_change);
+            
+            // Calculate stressed option price
+            let stressed_value = self.pricing_engine.calculate_option_price_with_params(
+                pool,
+                position.option_type,
+                position.strike,
+                position.time_to_expiry()?,
+                U256::from_f64_lossy(stressed_price),
+                stressed_vol,
+                self.pricing_engine.risk_free_rate + scenario.interest_rate_change,
+            )?;
+            
+            // Calculate PnL under stress
+            let base_value = self.pricing_engine.calculate_option_price(
+                pool,
+                position.option_type,
+                position.strike,
+                position.time_to_expiry()?,
+            )?;
+            
+            let pnl = (stressed_value.as_u128() as f64 - base_value.as_u128() as f64) 
+                     * position.amount.as_u128() as f64;
+            
+            results.push(pnl);
+        }
+        
+        Ok(results)
+    }
+
+    fn simulate_returns(&self, pool: &Pool, position: &Position, days: usize) -> Result<Vec<f64>> {
+        let mut returns = Vec::with_capacity(days);
+        let mut current_price = pool.current_price()?.as_u128() as f64;
+        let volatility = self.pricing_engine.get_implied_volatility(pool)?;
+        let dt = 1.0 / 252.0; // Daily timestep
+        
+        let normal = statrs::distribution::Normal::new(0.0, 1.0)?;
+        let mut rng = rand::thread_rng();
+        
+        for _ in 0..days {
+            // Simulate price movement using geometric Brownian motion
+            let z: f64 = normal.sample(&mut rng);
+            let drift = (self.pricing_engine.risk_free_rate - 0.5 * volatility * volatility) * dt;
+            let diffusion = volatility * z.sqrt() * dt.sqrt();
+            
+            let price_return = (drift + diffusion).exp();
+            let new_price = current_price * price_return;
+            
+            // Calculate option price at new market price
+            let new_option_price = self.pricing_engine.calculate_option_price_with_params(
+                pool,
+                position.option_type,
+                position.strike,
+                position.time_to_expiry()?,
+                U256::from_f64_lossy(new_price),
+                volatility,
+                self.pricing_engine.risk_free_rate,
+            )?;
+            
+            let old_option_price = self.pricing_engine.calculate_option_price_with_params(
+                pool,
+                position.option_type,
+                position.strike,
+                position.time_to_expiry()?,
+                U256::from_f64_lossy(current_price),
+                volatility,
+                self.pricing_engine.risk_free_rate,
+            )?;
+            
+            let return_pct = (new_option_price.as_u128() as f64 - old_option_price.as_u128() as f64)
+                            / old_option_price.as_u128() as f64;
+            
+            returns.push(return_pct);
+            current_price = new_price;
+        }
+        
+        Ok(returns)
+    }
+
+    fn calculate_portfolio_concentration(
+        &self,
+        pool: &Pool,
+        positions: &[Position],
+    ) -> Result<f64> {
+        let mut position_weights = Vec::new();
+        let mut total_notional = 0.0;
+        
+        // Calculate notional values and total
+        for position in positions {
+            let notional = self.calculate_notional_value(pool, position)?;
+            position_weights.push(notional);
+            total_notional += notional;
+        }
+        
+        if total_notional == 0.0 {
+            return Ok(0.0);
+        }
+        
+        // Calculate Herfindahl-Hirschman Index (HHI)
+        let hhi = position_weights.iter()
+            .map(|&w| (w / total_notional).powi(2))
+            .sum::<f64>();
+        
+        // Normalize HHI to [0,1]
+        let n = positions.len() as f64;
+        let normalized_hhi = if n <= 1.0 {
+            1.0
+        } else {
+            (hhi - 1.0/n) / (1.0 - 1.0/n)
+        };
+        
+        Ok(normalized_hhi)
+    }
+
+    fn calculate_portfolio_liquidity(
+        &self,
+        pool: &Pool,
+        positions: &[Position],
+    ) -> Result<f64> {
+        let mut weighted_liquidity = 0.0;
+        let mut total_weight = 0.0;
+        
+        for position in positions {
+            let notional = self.calculate_notional_value(pool, position)?;
+            let position_liquidity = self.calculate_position_liquidity(pool, position)?;
+            
+            weighted_liquidity += notional * position_liquidity;
+            total_weight += notional;
+        }
+        
+        if total_weight == 0.0 {
+            return Ok(1.0);
+        }
+        
+        Ok(weighted_liquidity / total_weight)
+    }
+
+    fn calculate_position_liquidity(&self, pool: &Pool, position: &Position) -> Result<f64> {
+        // Get market depth around strike
+        let depth = pool.get_depth_at_price(position.strike)?;
+        let position_size = position.amount.as_u128() as f64;
+        
+        // Calculate liquidity score based on position size relative to market depth
+        let liquidity_ratio = depth / position_size;
+        
+        // Apply exponential decay function to normalize score to [0,1]
+        Ok(1.0 - (-liquidity_ratio / 2.0).exp())
+    }
+
+    fn calculate_notional_value(&self, pool: &Pool, position: &Position) -> Result<f64> {
+        let price = self.pricing_engine.calculate_option_price(
+            pool,
+            position.option_type,
+            position.strike,
+            position.time_to_expiry()?,
+        )?;
+        
+        Ok(price.as_u128() as f64 * position.amount.as_u128() as f64)
+    }
 }

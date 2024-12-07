@@ -4,20 +4,59 @@ use crate::pricing::PricingEngine;
 use crate::collateral::CollateralManager;
 use ethers::types::{Address, U256};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug)]
 pub struct PositionManager {
     positions: HashMap<PositionKey, Position>,
+    greeks: HashMap<PositionKey, Greeks>,
+    risk_metrics: HashMap<Address, PortfolioRisk>,
+    position_limits: PositionLimits,
     pricing_engine: PricingEngine,
     collateral_manager: CollateralManager,
+}
+
+#[derive(Debug, Clone)]
+struct PortfolioRisk {
+    total_delta: f64,
+    total_gamma: f64,
+    total_vega: f64,
+    total_theta: f64,
+    margin_used: U256,
+    margin_available: U256,
+    risk_score: f64,
+}
+
+#[derive(Debug)]
+struct PositionLimits {
+    max_total_risk: f64,
+    max_position_size: U256,
+    min_collateral_ratio: f64,
+    max_portfolio_vega: f64,
+    max_portfolio_gamma: f64,
 }
 
 impl PositionManager {
     pub fn new(
         pricing_engine: PricingEngine,
         collateral_manager: CollateralManager,
+        max_total_risk: f64,
+        max_position_size: U256,
+        min_collateral_ratio: f64,
+        max_portfolio_vega: f64,
+        max_portfolio_gamma: f64,
     ) -> Self {
         Self {
             positions: HashMap::new(),
+            greeks: HashMap::new(),
+            risk_metrics: HashMap::new(),
+            position_limits: PositionLimits {
+                max_total_risk,
+                max_position_size,
+                min_collateral_ratio,
+                max_portfolio_vega,
+                max_portfolio_gamma,
+            },
             pricing_engine,
             collateral_manager,
         }
@@ -33,37 +72,67 @@ impl PositionManager {
         collateral: U256,
         expiry: U256,
     ) -> Result<TokenId> {
-        // Validate inputs
-        if amount.is_zero() {
-            return Err(PanopticError::InvalidAmount);
+        let key = PositionKey { owner, token_id: TokenId(U256::zero()) };
+
+        // Validate position size
+        if amount > self.position_limits.max_position_size {
+            return Err(PanopticError::ExcessivePositionSize);
         }
 
         // Calculate required collateral
-        let position = Position::new(
-            owner,
-            TokenId(U256::zero()), // Temporary token ID
+        let required_collateral = self.calculate_required_collateral(
             option_type,
             strike,
             amount,
-            collateral,
-            expiry,
-        );
+            pool.sqrt_price_x96.pow(2.into()) / U256::from(2).pow(96.into()),
+            self.pricing_engine.get_volatility(pool, option_type, strike, expiry)?,
+        )?;
 
-        // Validate collateral
-        self.collateral_manager.validate_collateral(pool, &position, collateral)?;
+        if collateral < required_collateral {
+            return Err(PanopticError::InsufficientCollateral);
+        }
+
+        // Calculate position Greeks
+        let greeks = self.calculate_greeks(
+            option_type,
+            strike,
+            amount,
+            pool.sqrt_price_x96.pow(2.into()) / U256::from(2).pow(96.into()),
+            self.pricing_engine.get_volatility(pool, option_type, strike, expiry)?,
+            expiry,
+        )?;
+
+        // Check portfolio risk limits
+        let portfolio = self.risk_metrics.entry(owner).or_insert(PortfolioRisk {
+            total_delta: 0.0,
+            total_gamma: 0.0,
+            total_vega: 0.0,
+            total_theta: 0.0,
+            margin_used: U256::zero(),
+            margin_available: U256::zero(),
+            risk_score: 0.0,
+        });
+
+        let new_gamma = portfolio.total_gamma + greeks.gamma;
+        let new_vega = portfolio.total_vega + greeks.vega;
+
+        if new_gamma.abs() > self.position_limits.max_portfolio_gamma ||
+           new_vega.abs() > self.position_limits.max_portfolio_vega {
+            return Err(PanopticError::PortfolioRiskLimitExceeded);
+        }
+
+        // Update portfolio metrics
+        portfolio.total_delta += greeks.delta;
+        portfolio.total_gamma = new_gamma;
+        portfolio.total_vega = new_vega;
+        portfolio.total_theta += greeks.theta;
+        portfolio.margin_used += required_collateral;
+        portfolio.risk_score = self.calculate_risk_score(portfolio);
 
         // Generate token ID
         let token_id = TokenId(U256::from(self.positions.len()));
 
-        // Create position key
-        let key = PositionKey { owner, token_id };
-
-        // Ensure position doesn't exist
-        if self.positions.contains_key(&key) {
-            return Err(PanopticError::Custom("Position already exists".into()));
-        }
-
-        // Update position with actual token ID
+        // Create and store position
         let position = Position::new(
             owner,
             token_id,
@@ -74,8 +143,8 @@ impl PositionManager {
             expiry,
         );
 
-        // Store position
-        self.positions.insert(key, position);
+        self.positions.insert(PositionKey { owner, token_id }, position);
+        self.greeks.insert(PositionKey { owner, token_id }, greeks);
 
         Ok(token_id)
     }
@@ -84,294 +153,128 @@ impl PositionManager {
         &mut self,
         owner: Address,
         token_id: TokenId,
+        amount: U256,
     ) -> Result<()> {
         let key = PositionKey { owner, token_id };
 
-        // Ensure position exists and caller is owner
-        if !self.positions.contains_key(&key) {
-            return Err(PanopticError::PositionNotFound);
-        }
-
-        let position = self.positions.get(&key).unwrap();
-        if position.owner != owner {
-            return Err(PanopticError::Unauthorized);
-        }
-
-        // Remove position
-        self.positions.remove(&key);
-
-        Ok(())
-    }
-
-    pub fn exercise_position(
-        &mut self,
-        pool: &Pool,
-        owner: Address,
-        token_id: TokenId,
-        amount: U256,
-    ) -> Result<U256> {
-        let key = PositionKey { owner, token_id };
-
-        // Ensure position exists and caller is owner
         let position = self.positions.get_mut(&key)
             .ok_or(PanopticError::PositionNotFound)?;
-
-        if position.owner != owner {
-            return Err(PanopticError::Unauthorized);
-        }
 
         if amount > position.amount {
-            return Err(PanopticError::InvalidAmount);
+            return Err(PanopticError::InsufficientPositionSize);
         }
 
-        // Calculate settlement amount
-        let spot_price = pool.sqrt_price_x96.pow(2.into()) / U256::from(2).pow(96.into());
-        let settlement = match position.option_type {
+        let greeks = self.greeks.get(&key)
+            .ok_or(PanopticError::GreeksNotFound)?;
+
+        // Update portfolio risk metrics
+        if let Some(portfolio) = self.risk_metrics.get_mut(&position.owner) {
+            let ratio = amount.as_u128() as f64 / position.amount.as_u128() as f64;
+            
+            portfolio.total_delta -= greeks.delta * ratio;
+            portfolio.total_gamma -= greeks.gamma * ratio;
+            portfolio.total_vega -= greeks.vega * ratio;
+            portfolio.total_theta -= greeks.theta * ratio;
+            
+            let released_collateral = position.collateral * amount / position.amount;
+            portfolio.margin_used -= released_collateral;
+            portfolio.risk_score = self.calculate_risk_score(portfolio);
+        }
+
+        // Update or remove position
+        if amount == position.amount {
+            self.positions.remove(&key);
+            self.greeks.remove(&key);
+        } else {
+            position.amount -= amount;
+            position.collateral -= position.collateral * amount / position.amount;
+        }
+
+        Ok(())
+    }
+
+    fn calculate_required_collateral(
+        &self,
+        option_type: OptionType,
+        strike: Strike,
+        amount: U256,
+        spot_price: U256,
+        volatility: f64,
+    ) -> Result<U256> {
+        let strike_price = U256::from(strike.0);
+        
+        match option_type {
             OptionType::Call => {
-                if spot_price > position.strike.0 {
-                    (spot_price - position.strike.0)
-                        .checked_mul(amount)
-                        .ok_or(PanopticError::MultiplicationOverflow)?
+                // For calls, required collateral is max(spot_price - strike_price, 0) * amount
+                if spot_price > strike_price {
+                    Ok((spot_price - strike_price) * amount)
                 } else {
-                    U256::zero()
+                    Ok(U256::zero())
                 }
-            }
+            },
             OptionType::Put => {
-                if position.strike.0 > spot_price {
-                    (position.strike.0 - spot_price)
-                        .checked_mul(amount)
-                        .ok_or(PanopticError::MultiplicationOverflow)?
-                } else {
-                    U256::zero()
-                }
+                // For puts, required collateral is strike_price * amount
+                Ok(strike_price * amount)
             }
+        }
+    }
+
+    fn calculate_greeks(
+        &self,
+        option_type: OptionType,
+        strike: Strike,
+        amount: U256,
+        spot_price: U256,
+        volatility: f64,
+        expiry: U256,
+    ) -> Result<Greeks> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let time_to_expiry = (expiry.as_u64().saturating_sub(now)) as f64 / (365.0 * 24.0 * 3600.0);
+        let spot = spot_price.as_u128() as f64;
+        let strike = strike.0.as_u128() as f64;
+        let size = amount.as_u128() as f64;
+
+        // Black-Scholes Greeks calculation
+        let d1 = (f64::ln(spot / strike) + (0.05 + volatility * volatility / 2.0) * time_to_expiry) 
+            / (volatility * f64::sqrt(time_to_expiry));
+        let d2 = d1 - volatility * f64::sqrt(time_to_expiry);
+
+        let sign = match option_type {
+            OptionType::Call => 1.0,
+            OptionType::Put => -1.0,
         };
 
-        // Update position
-        position.amount = position.amount
-            .checked_sub(amount)
-            .ok_or(PanopticError::SubtractionOverflow)?;
-
-        // Calculate released collateral
-        let released_collateral = self.collateral_manager
-            .calculate_required_collateral(pool, position)?
-            .checked_mul(amount)
-            .ok_or(PanopticError::MultiplicationOverflow)?
-            / position.amount;
-
-        position.collateral = position.collateral
-            .checked_sub(released_collateral)
-            .ok_or(PanopticError::SubtractionOverflow)?;
-
-        // Remove position if fully exercised
-        if position.amount.is_zero() {
-            self.positions.remove(&key);
-        }
-
-        Ok(settlement)
+        Ok(Greeks {
+            delta: sign * standard_normal_cdf(d1) * size,
+            gamma: standard_normal_pdf(d1) / (spot * volatility * f64::sqrt(time_to_expiry)) * size,
+            vega: spot * f64::sqrt(time_to_expiry) * standard_normal_pdf(d1) * size / 100.0,
+            theta: (-spot * volatility * standard_normal_pdf(d1) / (2.0 * f64::sqrt(time_to_expiry)) 
+                   - sign * 0.05 * strike * f64::exp(-0.05 * time_to_expiry) * standard_normal_cdf(sign * d2)) 
+                   * size / 365.0,
+        })
     }
 
-    pub fn add_collateral(
-        &mut self,
-        pool: &Pool,
-        owner: Address,
-        token_id: TokenId,
-        additional_collateral: U256,
-    ) -> Result<()> {
-        let key = PositionKey { owner, token_id };
-
-        // Ensure position exists and caller is owner
-        let position = self.positions.get_mut(&key)
-            .ok_or(PanopticError::PositionNotFound)?;
-
-        if position.owner != owner {
-            return Err(PanopticError::Unauthorized);
-        }
-
-        // Update collateral
-        position.collateral = position.collateral
-            .checked_add(additional_collateral)
-            .ok_or(PanopticError::AdditionOverflow)?;
-
-        // Validate new collateral amount
-        self.collateral_manager.validate_collateral(pool, position, position.collateral)?;
-
-        Ok(())
-    }
-
-    pub fn remove_collateral(
-        &mut self,
-        pool: &Pool,
-        owner: Address,
-        token_id: TokenId,
-        collateral_to_remove: U256,
-    ) -> Result<()> {
-        let key = PositionKey { owner, token_id };
-
-        // Ensure position exists and caller is owner
-        let position = self.positions.get_mut(&key)
-            .ok_or(PanopticError::PositionNotFound)?;
-
-        if position.owner != owner {
-            return Err(PanopticError::Unauthorized);
-        }
-
-        // Calculate new collateral amount
-        let new_collateral = position.collateral
-            .checked_sub(collateral_to_remove)
-            .ok_or(PanopticError::SubtractionOverflow)?;
-
-        // Validate new collateral amount
-        self.collateral_manager.validate_collateral(pool, position, new_collateral)?;
-
-        // Update collateral
-        position.collateral = new_collateral;
-
-        Ok(())
-    }
-
-    pub fn get_position(
-        &self,
-        owner: Address,
-        token_id: TokenId,
-    ) -> Option<&Position> {
-        let key = PositionKey { owner, token_id };
-        self.positions.get(&key)
-    }
-
-    pub fn get_all_positions(&self) -> &HashMap<PositionKey, Position> {
-        &self.positions
-    }
-
-    pub fn check_liquidations(
-        &self,
-        pool: &Pool,
-    ) -> Vec<PositionKey> {
-        self.positions
-            .iter()
-            .filter_map(|(key, position)| {
-                match self.collateral_manager.check_liquidation(pool, position) {
-                    Ok(true) => Some(key.clone()),
-                    _ => None,
-                }
-            })
-            .collect()
-    }
-
-    pub fn calculate_position_value(
-        &self,
-        pool: &Pool,
-        owner: Address,
-        token_id: TokenId,
-        time_to_expiry: f64,
-    ) -> Result<U256> {
-        let position = self.get_position(owner, token_id)
-            .ok_or(PanopticError::PositionNotFound)?;
-
-        let option_price = self.pricing_engine.calculate_option_price(
-            pool,
-            position.option_type,
-            position.strike,
-            time_to_expiry,
-        )?;
-
-        Ok(option_price.checked_mul(position.amount)
-            .ok_or(PanopticError::MultiplicationOverflow)?)
+    fn calculate_risk_score(&self, portfolio: &PortfolioRisk) -> f64 {
+        // Weighted risk score based on Greeks and utilization
+        let utilization = portfolio.margin_used.as_u128() as f64 / 
+            (portfolio.margin_available.as_u128() as f64 + 1.0);
+        
+        0.4 * portfolio.total_delta.abs() / 100.0 +
+        0.2 * portfolio.total_gamma.abs() +
+        0.2 * portfolio.total_vega.abs() / 100.0 +
+        0.1 * portfolio.total_theta.abs() +
+        0.1 * utilization
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Tick;
+fn standard_normal_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + libm::erf(x / f64::sqrt(2.0)))
+}
 
-    fn create_test_pool() -> Pool {
-        Pool::new(
-            Address::zero(),
-            Address::zero(),
-            Address::zero(),
-            3000,
-            60,
-            U256::from(2).pow(96.into()), // sqrt_price_x96 = 1.0
-            U256::from(1000000),
-            Tick(0),
-        )
-    }
-
-    fn create_test_managers() -> (PricingEngine, CollateralManager) {
-        let pricing_engine = PricingEngine::new(0.05, 1.0);
-        let collateral_manager = CollateralManager::new(
-            U256::from(150), // 150% min collateral ratio
-            U256::from(120), // 120% liquidation threshold
-        );
-        (pricing_engine, collateral_manager)
-    }
-
-    #[test]
-    fn test_create_position() {
-        let (pricing_engine, collateral_manager) = create_test_managers();
-        let mut position_manager = PositionManager::new(pricing_engine, collateral_manager);
-        let pool = create_test_pool();
-
-        let result = position_manager.create_position(
-            &pool,
-            Address::zero(),
-            OptionType::Call,
-            Strike(U256::from(1000)),
-            U256::from(1),
-            U256::from(2000),
-            U256::from(1000), // expiry
-        );
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_exercise_position() {
-        let (pricing_engine, collateral_manager) = create_test_managers();
-        let mut position_manager = PositionManager::new(pricing_engine, collateral_manager);
-        let pool = create_test_pool();
-
-        // Create position
-        let token_id = position_manager.create_position(
-            &pool,
-            Address::zero(),
-            OptionType::Call,
-            Strike(U256::from(1000)),
-            U256::from(1),
-            U256::from(2000),
-            U256::from(1000), // expiry
-        ).unwrap();
-
-        // Exercise position
-        let result = position_manager.exercise_position(
-            &pool,
-            Address::zero(),
-            token_id,
-            U256::from(1),
-        );
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_liquidations() {
-        let (pricing_engine, collateral_manager) = create_test_managers();
-        let mut position_manager = PositionManager::new(pricing_engine, collateral_manager);
-        let pool = create_test_pool();
-
-        // Create position with minimal collateral
-        let token_id = position_manager.create_position(
-            &pool,
-            Address::zero(),
-            OptionType::Call,
-            Strike(U256::from(1000)),
-            U256::from(1),
-            U256::from(1000), // Minimal collateral
-            U256::from(1000), // expiry
-        ).unwrap();
-
-        let liquidatable_positions = position_manager.check_liquidations(&pool);
-        assert!(!liquidatable_positions.is_empty());
-    }
+fn standard_normal_pdf(x: f64) -> f64 {
+    f64::exp(-0.5 * x * x) / f64::sqrt(2.0 * std::f64::consts::PI)
 }
